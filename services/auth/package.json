@@ -1,0 +1,11 @@
+{
+  "name": "@pipelinememory/auth-service",
+  "version": "1.0.0",
+  "description": "Authentication and RBAC token microservice",
+  "main": "src/index.js",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2"
+  }
+}

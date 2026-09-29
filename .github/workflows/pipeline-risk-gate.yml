@@ -1,0 +1,233 @@
+name: PipelineMemory Pre-Flight Risk Gate
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: 'Microservice to assess'
+        required: true
+        default: 'payments'
+      change_type:
+        description: 'Nature of change (code, config, db_migration, dependency, infra)'
+        required: true
+        default: 'db_migration'
+      strict_mode:
+        description: 'Fail CI job if risk score >= 50'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  risk-assessment:
+    name: 🛡️ Pre-Flight Risk Assessment
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 Extract Native Git Diff
+        id: extract_diff
+        run: |
+          mkdir -p .pipeline-memory
+
+          # Determine the comparison base branch
+          BASE_REF="${{ github.base_ref }}"
+          if [ -n "$BASE_REF" ] && git rev-parse --verify "origin/$BASE_REF" >/dev/null 2>&1; then
+            BASE="origin/$BASE_REF"
+          elif git rev-parse --verify origin/main >/dev/null 2>&1; then
+            BASE="origin/main"
+          elif git rev-parse --verify main >/dev/null 2>&1 && [ "$(git rev-parse HEAD)" != "$(git rev-parse main)" ]; then
+            BASE="main"
+          elif git rev-parse --verify master >/dev/null 2>&1 && [ "$(git rev-parse HEAD)" != "$(git rev-parse master)" ]; then
+            BASE="master"
+          else
+            BASE="HEAD~1"
+          fi
+
+          echo "Base branch for diff comparison: $BASE"
+
+          # Generate genuine Git unified diff for code and migration files (excluding non-code artifacts)
+          git diff "$BASE...HEAD" -- . ':(exclude)*.md' ':(exclude).act*' ':(exclude)*.sh' > .pipeline-memory/change.diff 2>/dev/null || true
+          
+          if [ ! -s .pipeline-memory/change.diff ]; then
+            git diff HEAD -- . ':(exclude)*.md' ':(exclude).act*' ':(exclude)*.sh' > .pipeline-memory/change.diff 2>/dev/null || true
+          fi
+
+          if [ ! -s .pipeline-memory/change.diff ]; then
+            git diff HEAD~1 HEAD -- . ':(exclude)*.md' ':(exclude).act*' ':(exclude)*.sh' > .pipeline-memory/change.diff 2>/dev/null || true
+          fi
+
+          DIFF_LINES=$(wc -l < .pipeline-memory/change.diff | tr -d ' ')
+          echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
+
+          echo "=================================================================="
+          echo "📄 GENUINE GIT UNIFIED DIFF ($DIFF_LINES lines):"
+          echo "=================================================================="
+          cat .pipeline-memory/change.diff
+          echo "=================================================================="
+
+      - name: 🌐 Locate PipelineMemory API Server
+        id: find_server
+        run: |
+          CANDIDATES=("http://host.docker.internal:3001" "http://127.0.0.1:3001" "http://localhost:3001" "http://172.17.0.1:3001")
+          SERVER_URL=""
+          
+          for url in "${CANDIDATES[@]}"; do
+            echo "Checking $url/api/stats ..."
+            if curl -s --max-time 3 "$url/api/stats" > /dev/null 2>&1; then
+              SERVER_URL="$url"
+              echo "✅ Connected to PipelineMemory at $url"
+              break
+            fi
+          done
+
+          if [ -z "$SERVER_URL" ]; then
+            # Default to host.docker.internal if act is using host gateway
+            SERVER_URL="http://host.docker.internal:3001"
+            echo "⚠️ Could not probe live server directly, defaulting to $SERVER_URL"
+          fi
+
+          echo "server_url=$SERVER_URL" >> $GITHUB_OUTPUT
+
+      - name: 🧠 Call PipelineMemory Pre-Flight Risk Engine
+        id: call_predict
+        run: |
+          SERVER="${{ steps.find_server.outputs.server_url }}"
+          SERVICE="${{ github.event.inputs.service_name || 'payments' }}"
+          CHANGE_TYPE="${{ github.event.inputs.change_type || 'db_migration' }}"
+          AUTHOR="${{ github.actor || 'act-ci-runner' }}"
+
+          echo "Querying $SERVER/api/predict for $SERVICE ($CHANGE_TYPE)..."
+
+          # Prepare JSON payload with genuine git diff and auto-calculated stats
+          node -e '
+            const fs = require("fs");
+            const diff = fs.existsSync(".pipeline-memory/change.diff") 
+              ? fs.readFileSync(".pipeline-memory/change.diff", "utf8") 
+              : "";
+
+            // Parse touched files and added/removed lines from genuine git diff
+            const lines = diff.split("\n");
+            let additions = 0, deletions = 0;
+            const files = new Set();
+
+            for (const line of lines) {
+              if (line.startsWith("diff --git a/") || line.startsWith("+++ b/")) {
+                const match = line.match(/(?:b\/|a\/)(.+?)$/);
+                if (match) files.add(match[1].trim());
+              }
+              if (line.startsWith("+") && !line.startsWith("+++")) additions++;
+              if (line.startsWith("-") && !line.startsWith("---")) deletions++;
+            }
+
+            const payload = {
+              service: process.argv[1],
+              change_type: process.argv[2],
+              author: process.argv[3],
+              diff: diff,
+              files_changed: files.size || 1,
+              lines_changed: additions + deletions || 4
+            };
+
+            fs.writeFileSync(".pipeline-memory/payload.json", JSON.stringify(payload, null, 2));
+            console.log(`Parsed diff: ${files.size} files touched, ${additions} additions, ${deletions} deletions`);
+          ' "$SERVICE" "$CHANGE_TYPE" "$AUTHOR"
+
+          # Call the /api/predict endpoint
+          HTTP_STATUS=$(curl -s -w "%{http_code}" -o .pipeline-memory/predict_response.json \
+            -X POST "$SERVER/api/predict" \
+            -H "Content-Type: application/json" \
+            -d @.pipeline-memory/payload.json)
+
+          echo "API Response HTTP Status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "❌ PipelineMemory API request failed with status $HTTP_STATUS:"
+            cat .pipeline-memory/predict_response.json
+            exit 1
+          fi
+
+      - name: 📊 Render Risk Assessment & Gate Verdict
+        id: gate_verdict
+        run: |
+          node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync(".pipeline-memory/predict_response.json", "utf8"));
+            
+            console.log("\n==================================================================");
+            console.log("🛡️  PIPELINEMEMORY PRE-FLIGHT RISK ASSESSMENT REPORT");
+            console.log("==================================================================");
+            console.log(`Risk Score:       ${data.risk_score} / 100 (${data.risk_level.toUpperCase()} RISK)`);
+            console.log(`Hindsight Memory: ${data.hindsight_powered ? "⚡ Powered by Episodic Memory Cloud" : "SQLite Local Fallback"}`);
+            console.log(`LLM Engine:       ${data.llm_powered ? "Active (Grok/Groq/Claude)" : "Deterministic Rule-Based"}`);
+            
+            console.log("\n--- ⚠️  TOP RISK FACTORS ---");
+            (data.factors || []).forEach(f => {
+              console.log(` • [${f.weight}%] ${f.name.padEnd(24)}: ${f.score}/100 — ${f.detail}`);
+            });
+
+            if (data.diff_analysis && data.diff_analysis.findings && data.diff_analysis.findings.length > 0) {
+              console.log("\n--- 🔍 CODE DIFF HAZARDS FLAGGED ---");
+              data.diff_analysis.findings.forEach(h => {
+                console.log(` • [${h.severity.toUpperCase()}] ${h.rule} in ${h.file} (Line ~${h.line}):`);
+                console.log(`   Description: ${h.description}`);
+                if (h.remediation) console.log(`   Remedy:      ${h.remediation}`);
+              });
+            }
+
+            if (data.proven_fixes && data.proven_fixes.length > 0) {
+              console.log("\n--- 🛠️  PROVEN HISTORICAL FIXES TO PASS GREEN ---");
+              data.proven_fixes.slice(0, 2).forEach(fix => {
+                console.log(` • Deploy #${fix.deployment_id} (${fix.service}): ${fix.fix_applied}`);
+              });
+            }
+
+            console.log("\n==================================================================");
+            const isBlocked = data.risk_score >= 50;
+            if (isBlocked) {
+              console.log("❌ VERDICT: BLOCKED FROM PRODUCTION (Requires Architectural Approval)");
+            } else {
+              console.log("✅ VERDICT: APPROVED FOR AUTOMATIC DEPLOYMENT");
+            }
+            console.log("==================================================================\n");
+
+            // Export outputs for next steps
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `risk_score=${data.risk_score}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `risk_level=${data.risk_level}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `is_blocked=${isBlocked ? "true" : "false"}\n`);
+          '
+
+      - name: 📡 Register Deployment Telemetry
+        if: always()
+        run: |
+          SERVER="${{ steps.find_server.outputs.server_url }}"
+          SERVICE="${{ github.event.inputs.service_name || 'payments' }}"
+          CHANGE_TYPE="${{ github.event.inputs.change_type || 'db_migration' }}"
+          STATUS="${{ steps.gate_verdict.outputs.is_blocked == 'true' && 'failed' || 'success' }}"
+          
+          echo "Sending deployment event to $SERVER/api/deployments..."
+          
+          curl -s -X POST "$SERVER/api/deployments" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"service\": \"$SERVICE\",
+              \"version\": \"v4.19.0-test-${{ github.run_number || 1 }}\",
+              \"author\": \"${{ github.actor || 'act-ci-runner' }}\",
+              \"status\": \"$STATUS\",
+              \"change_type\": \"$CHANGE_TYPE\",
+              \"files_changed\": 1,
+              \"lines_changed\": ${{ steps.extract_diff.outputs.diff_lines || 4 }},
+              \"notes\": \"Automated CI pipeline verification via act - Risk score ${{ steps.gate_verdict.outputs.risk_score }}/100\"
+            }" > /dev/null || echo "Telemetry callback sent"
+
+      - name: 🛑 Enforce Gate In Strict Mode
+        if: ${{ github.event.inputs.strict_mode == 'true' && steps.gate_verdict.outputs.is_blocked == 'true' }}
+        run: |
+          echo "❌ CI Pipeline Failed: Deployment blocked by PipelineMemory risk gate."
+          exit 1
